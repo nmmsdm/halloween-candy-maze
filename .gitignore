@@ -2,5 +2,9 @@ node_modules
 .nuxt
 .output
 .data
+data/game-settings.json
+data/maze.sqlite
+data/maze.sqlite-shm
+data/maze.sqlite-wal
 .env
 .DS_Store

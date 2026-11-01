@@ -1,0 +1,1 @@
+export const COMPANY_TERMS_VERSION = '2026-11-01'

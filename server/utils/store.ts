@@ -1,69 +1,73 @@
-import { promises as fs } from 'node:fs'
-import path from 'node:path'
 import { randomBytes } from 'node:crypto'
+import {
+  mutateGlobalStore,
+  type Difficulty,
+  type Winner,
+  type WinnerStore
+} from './database'
 
-export type Difficulty = 'easy' | 'medium' | 'hard'
-export type Winner = {
-  id: string
-  name: string
-  difficulty: Difficulty
-  completionTime: number
-  moves: number
-  claimCode: string
-  wonAt: string
-  claimed: boolean
-  claimedAt: string | null
+export type LeaderboardMetric = 'fastest' | 'fewestMoves'
+export type LeaderboardPeriod = 'monthly' | 'yearly'
+
+export function readWinnerStore(): Promise<WinnerStore> {
+  return Promise.resolve(readGlobalStore())
 }
 
-const dataDir = path.resolve(process.cwd(), 'data')
-const dataFile = path.join(dataDir, 'winners.json')
-let writeQueue: Promise<unknown> = Promise.resolve()
-
-async function ensureStore() {
-  await fs.mkdir(dataDir, { recursive: true })
-  try { await fs.access(dataFile) }
-  catch { await fs.writeFile(dataFile, '[]', 'utf8') }
+export function mutateWinnerStore<T>(mutate: (store: WinnerStore) => T): Promise<T> {
+  return Promise.resolve(mutateGlobalStore(mutate))
 }
 
-export async function readWinners(): Promise<Winner[]> {
-  await ensureStore()
-  try {
-    const raw = await fs.readFile(dataFile, 'utf8')
-    const parsed = JSON.parse(raw)
-    return Array.isArray(parsed) ? parsed : []
-  } catch {
-    return []
+export function allWinners(store: WinnerStore): Winner[] {
+  return [...store.archivedWinners, ...store.activeWinners]
+}
+
+function compareWinners(a: Winner, b: Winner, metric: LeaderboardMetric) {
+  if (metric === 'fewestMoves') {
+    return a.moves - b.moves ||
+      a.completionTime - b.completionTime ||
+      a.wonAt.localeCompare(b.wonAt)
   }
+  return a.completionTime - b.completionTime ||
+    a.moves - b.moves ||
+    a.wonAt.localeCompare(b.wonAt)
 }
 
-async function writeWinnersNow(rows: Winner[]) {
-  await ensureStore()
-  const temp = `${dataFile}.tmp`
-  await fs.writeFile(temp, JSON.stringify(rows, null, 2), 'utf8')
-  await fs.rename(temp, dataFile)
+function isInPeriod(winner: Winner, period: LeaderboardPeriod, now: Date) {
+  const wonAt = new Date(winner.wonAt)
+  if (Number.isNaN(wonAt.getTime())) return false
+  if (period === 'yearly') return wonAt.getFullYear() === now.getFullYear()
+  return wonAt.getFullYear() === now.getFullYear() && wonAt.getMonth() === now.getMonth()
 }
 
-export function mutateWinners<T>(fn: (rows: Winner[]) => Promise<T> | T): Promise<T> {
-  const operation = writeQueue.then(async () => {
-    const rows = await readWinners()
-    const result = await fn(rows)
-    await writeWinnersNow(rows)
-    return result
-  })
-  writeQueue = operation.then(() => undefined, () => undefined)
-  return operation
+export function leaderboard(
+  winners: Winner[],
+  period: LeaderboardPeriod = 'monthly',
+  metric: LeaderboardMetric = 'fastest',
+  now = new Date()
+) {
+  const eligible = winners.filter(winner => isInPeriod(winner, period, now))
+  const rank = (level: Difficulty) => {
+    const bestByPlayer = new Map<string, Winner>()
+
+    for (const winner of eligible) {
+      if (winner.difficulty !== level) continue
+      const key = winner.name.trim().toLowerCase()
+      const previous = bestByPlayer.get(key)
+      if (!previous || compareWinners(winner, previous, metric) < 0) {
+        bestByPlayer.set(key, winner)
+      }
+    }
+
+    return [...bestByPlayer.values()]
+      .sort((a, b) => compareWinners(a, b, metric))
+      .slice(0, 5)
+  }
+
+  return { easy: rank('easy'), medium: rank('medium'), hard: rank('hard') }
 }
 
 export function makeClaimCode() {
   return `CANDY-${randomBytes(4).toString('hex').toUpperCase()}`
-}
-
-export function leaderboard(rows: Winner[]) {
-  const rank = (level: Difficulty) => rows
-    .filter(w => w.difficulty === level)
-    .sort((a, b) => a.completionTime - b.completionTime || a.moves - b.moves || a.wonAt.localeCompare(b.wonAt))
-    .slice(0, 5)
-  return { easy: rank('easy'), medium: rank('medium'), hard: rank('hard') }
 }
 
 export function adminPin() {
