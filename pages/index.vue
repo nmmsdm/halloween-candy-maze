@@ -9,9 +9,9 @@ type Winner = { id: string; name: string; difficulty: string; completionTime: nu
 type Board = { easy: Winner[]; medium: Winner[]; hard: Winner[] }
 
 const presets: Record<Difficulty, { cells: number; seconds: number; label: string }> = {
-  easy: { cells: 7, seconds: 60, label: 'Easy · 1 min' },
-  medium: { cells: 11, seconds: 90, label: 'Medium · 1½ min' },
-  hard: { cells: 15, seconds: 150, label: 'Hard · 2½ min' }
+  easy: { cells: 6, seconds: 60, label: 'Easy · 1 min' },
+  medium: { cells: 9, seconds: 90, label: 'Medium · 1½ min' },
+  hard: { cells: 11, seconds: 120, label: 'Hard · 2 min' }
 }
 
 const phase = ref<Phase>('welcome')
@@ -34,6 +34,8 @@ const winBoards = ref<Board>({ easy: [], medium: [], hard: [] })
 const saveError = ref('')
 const error = ref('')
 const soundEnabled = ref(true)
+const existingPlayer = ref<Winner | null>(null)
+const showExistingPlayerPrompt = ref(false)
 
 const medals = ['🥇', '🥈', '🥉', '4.', '5.']
 const leftLevels: Array<'easy' | 'medium'> = ['easy', 'medium']
@@ -41,6 +43,7 @@ const leftLevels: Array<'easy' | 'medium'> = ['easy', 'medium']
 let interval: ReturnType<typeof setInterval> | undefined
 let ghostInterval: ReturnType<typeof setInterval> | undefined
 let chaseMusic: HTMLAudioElement | undefined
+let carStartAudio: HTMLAudioElement | undefined
 let audio: AudioContext | undefined
 let lastTick = 0
 
@@ -53,10 +56,7 @@ const gridStyle = computed(() => ({
 }))
 
 const carTransform = computed(() => ({
-  right: 'scaleX(-1)',
-  left: 'scaleX(1)',
-  up: 'rotate(90deg)',
-  down: 'rotate(-90deg)'
+  right: 'scaleX(-1)', left: 'scaleX(1)', up: 'rotate(90deg)', down: 'rotate(-90deg)'
 }[carDirection.value]))
 
 const flatCells = computed(() => maze.value.flatMap((row, r) =>
@@ -73,8 +73,47 @@ function formatTime(s: number) {
   return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s`
 }
 
+function cleanPlayerName(name: string) {
+  return name.trim().replace(/\s+/g, ' ').slice(0, 32)
+}
+
+/* ---------- LEADERBOARD ---------- */
+
+function keepBestPerPlayer(list: Winner[]) {
+  const best = new Map<string, Winner>()
+
+  for (const w of list) {
+    const key = w.name.trim().toLowerCase()
+    const old = best.get(key)
+
+    if (!old ||
+        w.completionTime < old.completionTime ||
+        (w.completionTime === old.completionTime && w.moves < old.moves)) {
+      best.set(key, w)
+    }
+  }
+
+  return [...best.values()].sort((a, b) =>
+    a.completionTime - b.completionTime || a.moves - b.moves
+  )
+}
+
+function findExistingPlayer(name: string, level: Difficulty) {
+  const key = name.trim().toLowerCase()
+  return winBoards.value[level].find(w => w.name.trim().toLowerCase() === key) || null
+}
+
 async function loadWinBoards() {
-  try { winBoards.value = await $fetch<Board>('/api/leaderboard') } catch {}
+  try {
+    const data = await $fetch<Board>('/api/leaderboard')
+    winBoards.value = {
+      easy: keepBestPerPlayer(data.easy),
+      medium: keepBestPerPlayer(data.medium),
+      hard: keepBestPerPlayer(data.hard)
+    }
+  } catch (err) {
+    console.error('Could not load leaderboard:', err)
+  }
 }
 
 /* ---------- AUDIO ---------- */
@@ -94,9 +133,7 @@ async function startSpookyMusic() {
   try {
     chaseMusic.currentTime = 0
     await chaseMusic.play()
-  } catch (err) {
-    console.warn('Could not play ghost chase music:', err)
-  }
+  } catch {}
 }
 
 function stopSpookyMusic() {
@@ -107,25 +144,67 @@ function stopSpookyMusic() {
 
 function toggleSound() {
   soundEnabled.value = !soundEnabled.value
-  if (!soundEnabled.value) return stopSpookyMusic()
+  if (!soundEnabled.value) {
+    stopSpookyMusic()
+    carStartAudio?.pause()
+    return
+  }
   if (ghostActive.value && phase.value === 'playing') void startSpookyMusic()
 }
 
 function beep(freq: number) {
   if (!soundEnabled.value || typeof window === 'undefined') return
+
   try {
     audio ??= new AudioContext()
+    if (audio.state === 'suspended') void audio.resume()
+
     const osc = audio.createOscillator()
     const gain = audio.createGain()
-    osc.type = 'sine'
-    osc.frequency.value = freq
-    gain.gain.setValueAtTime(0.06, audio.currentTime)
-    gain.gain.exponentialRampToValueAtTime(0.001, audio.currentTime + 0.13)
+    const now = audio.currentTime
+
+    osc.type = 'square'
+    osc.frequency.setValueAtTime(freq, now)
+    osc.frequency.exponentialRampToValueAtTime(Math.max(80, freq * 0.5), now + 0.12)
+
+    gain.gain.setValueAtTime(0.035, now)
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.12)
+
     osc.connect(gain)
     gain.connect(audio.destination)
-    osc.start()
-    osc.stop(audio.currentTime + 0.13)
+    osc.start(now)
+    osc.stop(now + 0.12)
   } catch {}
+}
+
+function playWinSound() {
+  if (!soundEnabled.value || typeof window === 'undefined') return
+  const s = new Audio('/sounds/applause.mp3')
+  s.volume = 0.8
+  void s.play().catch(() => {})
+}
+
+function playGhostCatchSound() {
+  if (!soundEnabled.value || typeof window === 'undefined') return
+  const s = new Audio('/sounds/ghost-scream.mp3')
+  s.volume = 0.75
+  void s.play().catch(() => {})
+}
+
+function playCarStartSound() {
+  if (!soundEnabled.value || typeof window === 'undefined') return
+  carStartAudio?.pause()
+  carStartAudio = new Audio('/sounds/car-start.mp3')
+  carStartAudio.volume = 0.7
+  carStartAudio.currentTime = 0
+  void carStartAudio.play().catch(() => {})
+}
+
+function stopCarStartSound() {
+  if (!carStartAudio) return
+  carStartAudio.pause()
+  carStartAudio.currentTime = 0
+  carStartAudio = undefined
 }
 
 /* ---------- MAZE ---------- */
@@ -142,10 +221,8 @@ function generateMaze(n: number) {
   while (stack.length) {
     const cur = stack[stack.length - 1]
     const options = [
-      { r: cur.r - 1, c: cur.c },
-      { r: cur.r + 1, c: cur.c },
-      { r: cur.r, c: cur.c - 1 },
-      { r: cur.r, c: cur.c + 1 }
+      { r: cur.r - 1, c: cur.c }, { r: cur.r + 1, c: cur.c },
+      { r: cur.r, c: cur.c - 1 }, { r: cur.r, c: cur.c + 1 }
     ].filter(p => p.r >= 0 && p.c >= 0 && p.r < n && p.c < n && !visited[p.r][p.c])
 
     if (!options.length) {
@@ -160,25 +237,24 @@ function generateMaze(n: number) {
     stack.push(next)
   }
 
-  // Add extra openings so there are alternate escape routes.
   const candidates: Point[] = []
 
   for (let r = 1; r < size - 1; r++) {
     for (let c = 1; c < size - 1; c++) {
       if (grid[r][c] !== '#') continue
+
       const horizontal = grid[r][c - 1] === ' ' && grid[r][c + 1] === ' '
       const vertical = grid[r - 1][c] === ' ' && grid[r + 1][c] === ' '
+
       if (horizontal || vertical) candidates.push({ r, c })
     }
   }
 
-  // Shuffle candidate walls.
   for (let i = candidates.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1))
     ;[candidates[i], candidates[j]] = [candidates[j], candidates[i]]
   }
 
-  // Easy = 2 extra openings, Medium = 3, Hard = 4.
   const extraRoutes = n <= 7 ? 2 : n <= 11 ? 3 : 4
   candidates.slice(0, extraRoutes).forEach(({ r, c }) => { grid[r][c] = ' ' })
 
@@ -194,10 +270,10 @@ function getRandomGhostSpawn(): Point {
     for (let c = 1; c < maze.value[r].length - 1; c++) {
       if (maze.value[r][c] !== ' ') continue
 
-      const playerDistance = Math.abs(r - player.value.r) + Math.abs(c - player.value.c)
-      const goalDistance = Math.abs(r - goal.value.r) + Math.abs(c - goal.value.c)
+      const pd = Math.abs(r - player.value.r) + Math.abs(c - player.value.c)
+      const gd = Math.abs(r - goal.value.r) + Math.abs(c - goal.value.c)
 
-      if (playerDistance >= 8 && goalDistance >= 3) possible.push({ r, c })
+      if (pd >= 8 && gd >= 3) possible.push({ r, c })
     }
   }
 
@@ -255,6 +331,7 @@ function ghostCaughtPlayer() {
 
 function moveGhost() {
   if (phase.value !== 'playing' || !ghostActive.value) return
+
   const next = nextGhostStep()
   if (next) ghost.value = next
 
@@ -271,9 +348,7 @@ function startChase() {
   ghostActive.value = true
   void startSpookyMusic()
 
-  // Lower number = faster ghost.
-  const speed = difficulty.value === 'easy' ? 350 : difficulty.value === 'medium' ? 250 : 100
-  ghostInterval = setInterval(moveGhost, speed)
+  ghostInterval = setInterval(moveGhost, 500)
 
   if (ghostCaughtPlayer()) {
     lostReason.value = 'ghost'
@@ -293,6 +368,7 @@ function stopChase() {
 function stopTimer() {
   if (interval) clearInterval(interval)
   interval = undefined
+  stopCarStartSound()
   stopChase()
 }
 
@@ -303,24 +379,28 @@ async function finish(win: boolean) {
 
   if (!win) {
     phase.value = 'lost'
-    beep(220)
+    lostReason.value === 'ghost' ? playGhostCatchSound() : beep(220)
     return
   }
 
   phase.value = 'won'
-  beep(880)
+  playWinSound()
   claimCode.value = 'SAVING...'
   saveError.value = ''
   leaderboardRank.value = null
 
   try {
+    const cleanName = cleanPlayerName(playerName.value)
+    playerName.value = cleanName
+
     const result = await $fetch<{
       winner: { claimCode: string; wonAt: string }
       rank: number | null
+      improved?: boolean
     }>('/api/winners', {
       method: 'POST',
       body: {
-        name: playerName.value,
+        name: cleanName,
         difficulty: difficulty.value,
         completionTime: elapsed.value,
         moves: moves.value
@@ -330,8 +410,10 @@ async function finish(win: boolean) {
     claimCode.value = result.winner.claimCode
     wonAt.value = new Date(result.winner.wonAt).toLocaleString()
     leaderboardRank.value = result.rank
+
     await loadWinBoards()
-  } catch {
+  } catch (err) {
+    console.error('Failed to save winner:', err)
     claimCode.value = 'NOT SAVED'
     wonAt.value = new Date().toLocaleString()
     saveError.value = 'Winner could not be saved. Please show this screen to the game administrator.'
@@ -348,14 +430,16 @@ function tick() {
   lastTick += delta * 1000
   secondsLeft.value = Math.max(0, secondsLeft.value - delta)
 
-  // Ghost appears after exactly 30 seconds of gameplay.
-  if (elapsed.value >= 30 && secondsLeft.value > 0) startChase()
+  // Ghost appears after 5 seconds
+  if (elapsed.value >= 5 && secondsLeft.value > 0) startChase()
 
   if (secondsLeft.value === 0) {
     lostReason.value = 'time'
     void finish(false)
   }
 }
+
+/* ---------- START / EXISTING PLAYER ---------- */
 
 function startGame() {
   error.value = ''
@@ -365,7 +449,23 @@ function startGame() {
     return
   }
 
-  playerName.value = playerName.value.trim().slice(0, 32)
+  playerName.value = cleanPlayerName(playerName.value)
+
+  const existing = findExistingPlayer(playerName.value, difficulty.value)
+
+  if (existing) {
+    existingPlayer.value = existing
+    showExistingPlayerPrompt.value = true
+    return
+  }
+
+  beginGame()
+}
+
+function beginGame() {
+  showExistingPlayerPrompt.value = false
+  existingPlayer.value = null
+
   stopTimer()
   setupChaseMusic()
 
@@ -387,9 +487,13 @@ function startGame() {
   ghostActive.value = false
 
   phase.value = 'playing'
+  playCarStartSound()
+
   lastTick = Date.now()
   interval = setInterval(tick, 200)
 }
+
+/* ---------- MOVEMENT ---------- */
 
 function move(dr: number, dc: number) {
   if (phase.value !== 'playing') return
@@ -420,13 +524,24 @@ function move(dr: number, dc: number) {
   if (r === goal.value.r && c === goal.value.c) void finish(true)
 }
 
+/* ---------- KEYBOARD ---------- */
+
 function onKey(e: KeyboardEvent) {
   if (phase.value !== 'playing') return
 
+  // No long press
+  if (e.repeat) {
+    e.preventDefault()
+    return
+  }
+
   const directions: Record<string, [number, number]> = {
-    ArrowUp: [-1, 0], ArrowDown: [1, 0], ArrowLeft: [0, -1], ArrowRight: [0, 1],
-    w: [-1, 0], W: [-1, 0], s: [1, 0], S: [1, 0],
-    a: [0, -1], A: [0, -1], d: [0, 1], D: [0, 1]
+    ArrowUp: [-1, 0], ArrowDown: [1, 0],
+    ArrowLeft: [0, -1], ArrowRight: [0, 1],
+    w: [-1, 0], W: [-1, 0],
+    s: [1, 0], S: [1, 0],
+    a: [0, -1], A: [0, -1],
+    d: [0, 1], D: [0, 1]
   }
 
   const direction = directions[e.key]
@@ -436,8 +551,12 @@ function onKey(e: KeyboardEvent) {
   move(...direction)
 }
 
+/* ---------- MENU ---------- */
+
 function backToWelcome() {
   stopTimer()
+  showExistingPlayerPrompt.value = false
+  existingPlayer.value = null
   phase.value = 'welcome'
   error.value = ''
 }
@@ -451,8 +570,11 @@ function onVisibility() {
   if (document.visibilityState === 'visible') tick()
 }
 
+/* ---------- LIFECYCLE ---------- */
+
 onMounted(() => {
   setupChaseMusic()
+  void loadWinBoards()
   window.addEventListener('keydown', onKey)
   document.addEventListener('visibilitychange', onVisibility)
 })
@@ -460,6 +582,7 @@ onMounted(() => {
 onUnmounted(() => {
   stopTimer()
   stopSpookyMusic()
+  stopCarStartSound()
   window.removeEventListener('keydown', onKey)
   document.removeEventListener('visibilitychange', onVisibility)
   void audio?.close()
@@ -488,7 +611,7 @@ onUnmounted(() => {
 
         <form class="setup" @submit.prevent="startGame">
           <label for="player-name">YOUR NAME</label>
-          <input id="player-name" v-model="playerName" maxlength="32" placeholder="Enter your name" autocomplete="nickname" />
+          <input id="player-name" v-model="playerName" maxlength="32" placeholder="Enter your name" autocomplete="nickname">
 
           <label for="difficulty">MAZE DIFFICULTY</label>
           <select id="difficulty" v-model="difficulty">
@@ -505,8 +628,35 @@ onUnmounted(() => {
           <button class="primary" type="submit">🎮 START THE MAZE</button>
         </form>
 
-        <NuxtLink to="/leaderboard" class="leaderboard-button">🏆 VIEW WINNERS & TOP 5</NuxtLink>
+        <NuxtLink to="/leaderboard" class="leaderboard-button">🏆 HALLOWEEN LEADERBOARD</NuxtLink>
         <p class="small-note">📱 Use on-screen arrows · ⌨️ Use keyboard arrows or WASD</p>
+
+        <!-- EXISTING PLAYER -->
+        <div v-if="showExistingPlayerPrompt && existingPlayer" class="existing-player-overlay">
+          <div class="existing-player-modal">
+            <div class="existing-icon">🏆</div>
+            <p class="eyebrow">WELCOME BACK</p>
+            <h2>Player Already Exists!</h2>
+
+            <p>
+              <strong>{{ playerName }}</strong> already has a
+              <strong>{{ difficulty.toUpperCase() }}</strong> record.
+            </p>
+
+            <div class="existing-record">
+              <span>YOUR CURRENT BEST</span>
+              <strong>⏱ {{ formatTime(existingPlayer.completionTime) }}</strong>
+              <small>🚗 {{ existingPlayer.moves }} moves</small>
+            </div>
+
+            <p class="existing-message">Play again and try to beat your best record!</p>
+
+            <div class="existing-actions">
+              <button type="button" class="primary" @click="beginGame">🚗 PLAY AGAIN</button>
+              <button type="button" class="text-button centered" @click="showExistingPlayerPrompt = false">Cancel</button>
+            </div>
+          </div>
+        </div>
       </template>
 
       <!-- PLAYING -->
@@ -518,16 +668,12 @@ onUnmounted(() => {
         </div>
 
         <div v-if="ghostActive" class="ghost-warning">👻 THE GHOST IS COMING! RUN!</div>
-        <h1 class="game-title">Find the <span>candy!</span> 🍬</h1>
+        <h1 class="game-title">Get the <span>candy!</span> 🍬</h1>
 
         <div class="maze-wrap">
           <div class="maze" :style="gridStyle" role="img" aria-label="Maze with car, ghost and candy">
-            <div
-              v-for="cell in flatCells"
-              :key="cell.key"
-              class="cell"
-              :class="{ wall: cell.wall, floor: !cell.wall, goal: cell.goal }"
-            >
+            <div v-for="cell in flatCells" :key="cell.key" class="cell"
+              :class="{ wall: cell.wall, floor: !cell.wall, goal: cell.goal }">
               <span v-if="cell.player" class="piece" :style="{ transform: carTransform }">🚗</span>
               <span v-else-if="cell.ghost" class="piece maze-ghost">👻</span>
               <span v-else-if="cell.goal" class="piece candy">🍬</span>
@@ -537,11 +683,12 @@ onUnmounted(() => {
 
         <div class="control-area">
           <p class="small-note">Move the car 🚗 to the candy 🍬</p>
+
           <div class="dpad">
-            <button aria-label="Move up" class="up" @click="move(-1, 0)">▲</button>
-            <button aria-label="Move left" class="left" @click="move(0, -1)">◀</button>
-            <button aria-label="Move down" class="down" @click="move(1, 0)">▼</button>
-            <button aria-label="Move right" class="right" @click="move(0, 1)">▶</button>
+            <button aria-label="Move up" class="up" @pointerdown.prevent="move(-1, 0)">▲</button>
+            <button aria-label="Move left" class="left" @pointerdown.prevent="move(0, -1)">◀</button>
+            <button aria-label="Move down" class="down" @pointerdown.prevent="move(1, 0)">▼</button>
+            <button aria-label="Move right" class="right" @pointerdown.prevent="move(0, 1)">▶</button>
           </div>
         </div>
 
@@ -567,7 +714,7 @@ onUnmounted(() => {
             </div>
 
             <p v-if="leaderboardRank" class="rank-banner">
-              🏆 You are #{{ leaderboardRank }} on the {{ difficulty }} Top 5!
+              🏆 You are #{{ leaderboardRank }} on the {{ difficulty }} leaderboard!
             </p>
 
             <div class="claim">
@@ -578,17 +725,15 @@ onUnmounted(() => {
 
             <p v-if="saveError" class="error">{{ saveError }}</p>
 
+            <!-- EASY + MEDIUM -->
             <div class="left-boards">
               <article v-for="level in leftLevels" :key="level" class="mini-board">
                 <h2>{{ level === 'easy' ? '🟢 EASY TOP 5' : '🟠 MEDIUM TOP 5' }}</h2>
+
                 <div v-if="!winBoards[level].length" class="empty">No winners yet 👻</div>
 
-                <div
-                  v-for="(w, i) in winBoards[level]"
-                  :key="w.id"
-                  class="mini-score"
-                  :class="{ 'current-player': w.name === playerName && w.completionTime === elapsed && w.moves === moves }"
-                >
+                <div v-for="(w, i) in winBoards[level]" :key="w.id" class="mini-score"
+                  :class="{ 'current-player': w.name.trim().toLowerCase() === playerName.trim().toLowerCase() }">
                   <strong>{{ medals[i] }} {{ w.name }}</strong>
                   <span>{{ formatTime(w.completionTime) }} · {{ w.moves }} moves</span>
                 </div>
@@ -596,18 +741,15 @@ onUnmounted(() => {
             </div>
           </div>
 
+          <!-- HARD -->
           <aside class="hard-board">
             <p class="eyebrow">ULTIMATE CHALLENGE</p>
             <h2>🔴 HARD TOP 5</h2>
 
             <div v-if="!winBoards.hard.length" class="empty">No hard-mode winners yet 👻</div>
 
-            <div
-              v-for="(w, i) in winBoards.hard"
-              :key="w.id"
-              class="hard-score"
-              :class="{ 'current-player': w.name === playerName && w.completionTime === elapsed && w.moves === moves }"
-            >
+            <div v-for="(w, i) in winBoards.hard" :key="w.id" class="hard-score"
+              :class="{ 'current-player': w.name.trim().toLowerCase() === playerName.trim().toLowerCase() }">
               <div class="hard-place">{{ medals[i] }}</div>
               <div class="hard-name">{{ w.name }}</div>
               <div class="hard-time">{{ formatTime(w.completionTime) }}<small>{{ w.moves }} moves</small></div>
@@ -618,6 +760,7 @@ onUnmounted(() => {
         </div>
 
         <p class="small-note">Claim code is for display only. Candy station staff must check claims manually.</p>
+
         <button class="primary win-action" @click="mode === 'station' ? nextPlayer() : backToWelcome()">
           {{ mode === 'station' ? '👤 NEXT PLAYER' : '🎮 PLAY AGAIN' }}
         </button>
@@ -637,9 +780,10 @@ onUnmounted(() => {
           }}
         </p>
 
-        <button class="primary" @click="startGame">🔁 TRY AGAIN</button>
+        <button class="primary" @click="beginGame">🔁 TRY AGAIN</button>
         <button class="text-button centered" @click="backToWelcome">Back to menu</button>
       </template>
+
     </section>
 
     <footer>🚗 Happy Halloween! · Made for spooky fun · No accounts required</footer>
